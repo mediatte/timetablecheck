@@ -49,14 +49,15 @@
 var CONFIG = {
   TIMETABLE_SHEET: '시간표',
   ROSTER_SHEET_PATTERN: /^(\d+)-(\d+)$/, // 예: "2-1", "3-12"
-  TIMEZONE: 'Asia/Seoul',
+  TIMEZONE: 'Asia/Seoul', // 참고용 표기. 실제 시간 계산은 KST_OFFSET_MS_(UTC+9 고정)로 직접 계산함
   MAX_SEARCH_RESULTS: 30,
-  VERSION: '1.2.0',
+  VERSION: '1.3.0',
   VERSION_DATE: '2026-08-29',
   CHANGELOG: [
     { version: '1.0.0', date: '2026-08-29', note: '최초 작성: 학번/이름 일부 검색, 현재 위치 및 오늘 시간표 표시' },
     { version: '1.1.0', date: '2026-08-29', note: '1학년(개인 명단 없음) 학급 시간표 기반 안내 추가, "오늘 시간표"를 "현재 위치 + 일주일 전체 이동시간표(교시x요일 그리드)"로 변경' },
-    { version: '1.2.0', date: '2026-08-29', note: 'resolvePeriod_ 단순화: 이동수업 여부를 학생 본인 반 칸의 슬롯 문자 유무로만 판단(다른 반 참고 안 함). 문자가 없는 모든 교시는 시간표 그 칸(과목명/교사명)을 그대로 사용해 고정 시간표도 빠짐없이 표시' }
+    { version: '1.2.0', date: '2026-08-29', note: 'resolvePeriod_ 단순화: 이동수업 여부를 학생 본인 반 칸의 슬롯 문자 유무로만 판단(다른 반 참고 안 함). 문자가 없는 모든 교시는 시간표 그 칸(과목명/교사명)을 그대로 사용해 고정 시간표도 빠짐없이 표시' },
+    { version: '1.3.0', date: '2026-08-29', note: '버그 수정: 시간범위/교시번호 행을 헤더 기준 고정 오프셋(+1,+2)으로 가정하던 것을 내용 패턴 기반 탐색으로 교체(오프셋이 안 맞아 periodTimes가 통째로 비어 항상 "방과 후"로 표시되던 문제). 시간 구분자(~,〜,～,-) 인식 강화. 날짜/시각 계산도 Utilities.formatDate 대신 UTC+9 고정 오프셋으로 직접 계산해 타임존 설정과 무관하게 정확하도록 변경. debugTimetableParse() 진단 함수 추가' }
   ]
 };
 
@@ -69,6 +70,27 @@ function doGet(e) {
     .setTitle('이동수업 위치 확인')
     .addMetaTag('viewport', 'width=device-width, initial-scale=1')
     .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+/**
+ * 진단용: Apps Script 편집기에서 이 함수를 직접 "실행"해서 로그(보기 > 로그)를
+ * 확인하면, "시간표" 시트가 제대로 파싱됐는지(교시 수, 시간 범위 등) 바로 알 수 있다.
+ * 문제가 있으면 이 로그를 참고해서 CONFIG/파싱 로직을 조정하면 된다.
+ */
+function debugTimetableParse() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var timetable = parseTimetable_(ss);
+  var periods = Object.keys(timetable.periodTimes).map(Number).sort(function (a, b) { return a - b; });
+  Logger.log('찾은 교시 수: ' + periods.length + ' (' + periods.join(',') + ')');
+  periods.forEach(function (p) {
+    Logger.log(p + '교시: ' + timetable.periodTimes[p].label +
+      ' (' + timetable.periodTimes[p].startMin + '~' + timetable.periodTimes[p].endMin + '분)');
+  });
+  Logger.log('학년 목록: ' + Object.keys(timetable.grid).join(', '));
+  Object.keys(timetable.grid).forEach(function (g) {
+    Logger.log(g + '학년 반 목록: ' + Object.keys(timetable.grid[g]).join(', '));
+  });
+  return { periodCount: periods.length, periods: periods, grades: Object.keys(timetable.grid) };
 }
 
 function getVersionInfo() {
@@ -168,7 +190,7 @@ function parseTimetable_(ss) {
   if (!sheet) throw new Error('"' + CONFIG.TIMETABLE_SHEET + '" 시트를 찾을 수 없습니다.');
   var values = sheet.getDataRange().getValues();
 
-  // 헤더 행 찾기: '학년' 과 '반' 이 같은 행에 있는 행
+  // 헤더 행 찾기: '학년' 과 '반' 이 같은 행에 있는 행 (요일명도 이 행에 함께 있음)
   var headerRowIdx = -1, gradeCol = -1, classCol = -1;
   for (var r = 0; r < Math.min(values.length, 10); r++) {
     var g = values[r].indexOf('학년');
@@ -176,11 +198,30 @@ function parseTimetable_(ss) {
     if (g !== -1 && c !== -1) { headerRowIdx = r; gradeCol = g; classCol = c; break; }
   }
   if (headerRowIdx === -1) throw new Error('"시간표" 시트에서 헤더(학년/반) 행을 찾지 못했습니다.');
-
   var dayNameRow = values[headerRowIdx];
-  var timeRangeRow = values[headerRowIdx + 1] || [];
-  var periodNumRow = values[headerRowIdx + 2] || [];
-  var dataStartRow = headerRowIdx + 3;
+
+  // 시간범위 행 / 교시번호 행은 "헤더 바로 아래 몇 줄 안"에 있다고만 가정하고,
+  // 정확한 줄 위치는 고정 오프셋이 아니라 셀 내용 패턴으로 직접 찾는다.
+  // (엑셀->구글시트 변환 과정에서 줄 위치가 한두 줄 밀려도 안전하게 동작하도록)
+  var searchEnd = Math.min(values.length, headerRowIdx + 8);
+  var timeRangeRowIdx = -1, periodNumRowIdx = -1, bestTimeScore = 0, bestPeriodScore = 0;
+  for (var rr = headerRowIdx + 1; rr < searchEnd; rr++) {
+    var row = values[rr];
+    var timeScore = 0, periodScore = 0;
+    for (var cc = classCol + 1; cc < row.length; cc++) {
+      if (extractTimeRange_(row[cc])) timeScore++;
+      if (isSmallPeriodNumber_(row[cc])) periodScore++;
+    }
+    if (timeScore > bestTimeScore) { bestTimeScore = timeScore; timeRangeRowIdx = rr; }
+    if (periodScore > bestPeriodScore) { bestPeriodScore = periodScore; periodNumRowIdx = rr; }
+  }
+  if (timeRangeRowIdx === -1 || periodNumRowIdx === -1) {
+    throw new Error('"시간표" 시트에서 교시 시간/번호가 적힌 행을 찾지 못했습니다. (헤더 아래 ' +
+      (searchEnd - headerRowIdx - 1) + '줄 이내에서 탐색함) 시트 구조를 확인해주세요.');
+  }
+  var timeRangeRow = values[timeRangeRowIdx];
+  var periodNumRow = values[periodNumRowIdx];
+  var dataStartRow = Math.max(headerRowIdx, timeRangeRowIdx, periodNumRowIdx) + 1;
 
   // 요일/교시 -> 컬럼 매핑 (요일명은 병합셀이라 오른쪽으로 이어지며 빈칸)
   var colMap = {}; // colIdx -> {day, period}
@@ -189,10 +230,7 @@ function parseTimetable_(ss) {
   for (var col = classCol + 1; col < lastCol; col++) {
     var dayVal = dayNameRow[col];
     if (dayVal !== '' && dayVal !== null && dayVal !== undefined) curDay = String(dayVal).trim();
-    var pVal = periodNumRow[col];
-    var period = null;
-    if (typeof pVal === 'number') period = pVal;
-    else if (typeof pVal === 'string' && /^\d+$/.test(pVal.trim())) period = parseInt(pVal.trim(), 10);
+    var period = isSmallPeriodNumber_(periodNumRow[col]) ? Number(String(periodNumRow[col]).trim()) : null;
     if (curDay && period) colMap[col] = { day: curDay, period: period };
   }
 
@@ -204,13 +242,8 @@ function parseTimetable_(ss) {
     var col = Number(colStr);
     var period = colMap[col].period;
     if (periodTimes[period]) return;
-    var raw = timeRangeRow[col];
-    if (typeof raw === 'string' && raw.indexOf('~') !== -1) {
-      var parts = raw.split('~');
-      var s = toMinutes_(parts[0].trim());
-      var e = toMinutes_(parts[1].trim());
-      if (s !== null && e !== null) periodTimes[period] = { startMin: s, endMin: e, label: raw.trim() };
-    }
+    var range = extractTimeRange_(timeRangeRow[col]);
+    if (range) periodTimes[period] = range;
   });
 
   // 데이터 행 순회하며 grid, letterTimeSets 구성
@@ -271,10 +304,29 @@ function parseCellText_(raw) {
   return { subject: subjectLine, teacher: teacher, letter: null, raw: raw };
 }
 
-function toMinutes_(hhmm) {
-  var m = hhmm.match(/^(\d{1,2}):(\d{2})$/);
+/** 셀 값이 "1"~"12" 범위의 (문자열이든 숫자든) 작은 정수인지 - 교시 번호 판별용 */
+function isSmallPeriodNumber_(v) {
+  if (typeof v === 'number') return Number.isInteger(v) && v >= 1 && v <= 12;
+  if (typeof v === 'string') {
+    var t = v.trim();
+    return /^\d{1,2}$/.test(t) && Number(t) >= 1 && Number(t) <= 12;
+  }
+  return false;
+}
+
+/**
+ * 셀 값에서 "HH:MM~HH:MM" 형태의 시간 범위를 뽑아낸다. 구분자는 '~' 외에
+ * 전각 물결(～), 물결표(〜), 하이픈류(-, –, —) 도 모두 허용한다
+ * (엑셀->구글시트 변환 시 문자가 바뀌는 경우에 대비).
+ */
+function extractTimeRange_(v) {
+  var s = String(v == null ? '' : v).trim();
+  var m = s.match(/(\d{1,2}):(\d{2})\s*[~〜～\-–—]+\s*(\d{1,2}):(\d{2})/);
   if (!m) return null;
-  return parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
+  var startMin = parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
+  var endMin = parseInt(m[3], 10) * 60 + parseInt(m[4], 10);
+  if (endMin <= startMin) return null;
+  return { startMin: startMin, endMin: endMin, label: m[1] + ':' + m[2] + '~' + m[3] + ':' + m[4] };
 }
 
 function extractLeadingNumber_(val) {
@@ -438,13 +490,42 @@ function briefStudent_(s) {
   return { id: s.id, name: s.name, grade: s.grade, homeroom: s.homeroom, no: s.no };
 }
 
+var KST_OFFSET_MS_ = 9 * 60 * 60 * 1000; // Asia/Seoul = UTC+9 고정 (서머타임 없음)
+
+/**
+ * Date 객체를 한국시간(KST) 기준 연/월/일/시/분/초/요일로 분해한다.
+ * Utilities.formatDate 의 타임존 패턴에 기대지 않고 직접 계산하므로,
+ * 스크립트(프로젝트) 기본 타임존 설정과 무관하게 항상 정확하다.
+ */
+function toKstParts_(date) {
+  var t = new Date(date.getTime() + KST_OFFSET_MS_);
+  return {
+    year: t.getUTCFullYear(), month: t.getUTCMonth() + 1, day: t.getUTCDate(),
+    hour: t.getUTCHours(), minute: t.getUTCMinutes(), second: t.getUTCSeconds(),
+    dow: t.getUTCDay() // 0=일,1=월,...,6=토
+  };
+}
+
+/** <input type="datetime-local"> 값("YYYY-MM-DDTHH:mm[:ss]")을 "그 값 자체가 한국시간"으로 해석해 Date로 변환한다. */
+function parseTestTimeAsKst_(str) {
+  var m = String(str || '').trim().match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?/);
+  if (!m) return new Date();
+  var y = +m[1], mo = +m[2], d = +m[3], hh = +m[4], mi = +m[5], ss = +(m[6] || 0);
+  return new Date(Date.UTC(y, mo - 1, d, hh, mi, ss) - KST_OFFSET_MS_);
+}
+
+function pad2_(n) { return (n < 10 ? '0' : '') + n; }
+
+function formatKst_(kst) {
+  return kst.year + '-' + pad2_(kst.month) + '-' + pad2_(kst.day) + ' ' +
+    pad2_(kst.hour) + ':' + pad2_(kst.minute) + ':' + pad2_(kst.second);
+}
+
 function buildStudentResult_(data, student, testTime) {
-  var now = testTime ? new Date(testTime) : new Date();
-  var tz = CONFIG.TIMEZONE;
-  var dowIso = Number(Utilities.formatDate(now, tz, 'u')); // 1=월 ... 7=일
-  var hh = Number(Utilities.formatDate(now, tz, 'HH'));
-  var mm = Number(Utilities.formatDate(now, tz, 'mm'));
-  var minutes = hh * 60 + mm;
+  var now = testTime ? parseTestTimeAsKst_(testTime) : new Date();
+  var kst = toKstParts_(now);
+  var dowIso = kst.dow === 0 ? 7 : kst.dow; // JS getUTCDay: 0=일..6=토 -> 1=월..7=일
+  var minutes = kst.hour * 60 + kst.minute;
   var dayNames = { 1: '월', 2: '화', 3: '수', 4: '목', 5: '금', 6: '토', 7: '일' };
   var dayLabel = dayNames[dowIso];
   var dayOrder = data.timetable.dayOrder; // ['월','화','수','목','금']
@@ -453,7 +534,7 @@ function buildStudentResult_(data, student, testTime) {
 
   var result = {
     student: briefStudent_(student),
-    generatedAt: Utilities.formatDate(now, tz, 'yyyy-MM-dd HH:mm:ss'),
+    generatedAt: formatKst_(kst),
     usedTestTime: !!testTime,
     dayLabel: dayLabel,
     dayOrder: dayOrder,
