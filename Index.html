@@ -1,0 +1,250 @@
+<style>
+  :root {
+    --bg: #f5f6f8;
+    --card: #ffffff;
+    --text: #1c1e21;
+    --sub: #6b7280;
+    --line: #e5e7eb;
+    --accent: #2563eb;
+    --accent-bg: #eef2ff;
+    --warn: #b45309;
+    --warn-bg: #fef3c7;
+    --ok-bg: #ecfdf5;
+    --ok: #047857;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  .wrap { max-width: 640px; margin: 0 auto; padding: 20px 16px 60px; }
+  h1 { font-size: 20px; margin: 4px 0 16px; }
+  .searchRow { display: flex; gap: 8px; }
+  input[type="text"] {
+    flex: 1;
+    padding: 12px 14px;
+    font-size: 16px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    outline: none;
+  }
+  input[type="text"]:focus { border-color: var(--accent); }
+  button {
+    padding: 12px 18px;
+    font-size: 15px;
+    border: none;
+    border-radius: 10px;
+    background: var(--accent);
+    color: #fff;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  button:active { opacity: 0.85; }
+  .advanced { margin-top: 10px; font-size: 13px; color: var(--sub); }
+  .advanced summary { cursor: pointer; }
+  .advanced .row { margin-top: 8px; display: flex; align-items: center; gap: 8px; }
+  .advanced input[type="datetime-local"] {
+    padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; font-size: 13px;
+  }
+  #message { margin-top: 14px; color: var(--sub); font-size: 14px; }
+  #message.error { color: #b91c1c; }
+
+  .candList { margin-top: 14px; display: flex; flex-direction: column; gap: 8px; }
+  .candItem {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 12px 14px; background: var(--card); border: 1px solid var(--line);
+    border-radius: 10px; cursor: pointer;
+  }
+  .candItem:active { background: var(--accent-bg); }
+  .candItem .name { font-weight: 600; }
+  .candItem .meta { color: var(--sub); font-size: 13px; }
+
+  .card {
+    margin-top: 16px; background: var(--card); border: 1px solid var(--line);
+    border-radius: 14px; padding: 18px; box-shadow: 0 1px 2px rgba(0,0,0,0.03);
+  }
+  .studentHead { display: flex; justify-content: space-between; align-items: baseline; }
+  .studentHead .name { font-size: 19px; font-weight: 700; }
+  .studentHead .meta { color: var(--sub); font-size: 13px; }
+
+  .statusBox {
+    margin-top: 14px; padding: 16px; border-radius: 12px; background: var(--accent-bg);
+  }
+  .statusBox .status { font-size: 15px; font-weight: 700; color: var(--accent); }
+  .statusBox.dim { background: #f3f4f6; }
+  .statusBox.dim .status { color: var(--sub); }
+  .statusBox .loc { font-size: 22px; font-weight: 800; margin-top: 6px; }
+  .statusBox .sub { color: var(--sub); font-size: 14px; margin-top: 4px; }
+
+  table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 6px; border-bottom: 1px solid var(--line); }
+  th { color: var(--sub); font-weight: 600; }
+  tr.current td { background: var(--ok-bg); font-weight: 600; }
+  tr.current td:first-child { border-left: 3px solid var(--ok); }
+
+  .sectionTitle { margin: 20px 0 4px; font-size: 14px; font-weight: 700; color: var(--sub); }
+  .specialList { list-style: none; padding: 0; margin: 6px 0 0; }
+  .specialList li {
+    padding: 8px 0; border-bottom: 1px dashed var(--line); font-size: 13px;
+    display: flex; justify-content: space-between; gap: 10px;
+  }
+  .specialList .lab { color: var(--sub); }
+
+  .footer { margin-top: 26px; text-align: center; color: #9ca3af; font-size: 11px; }
+</style>
+
+<div class="wrap">
+  <h1>🏫 이동수업 위치 확인</h1>
+
+  <div class="searchRow">
+    <input id="q" type="text" placeholder="학번 또는 이름 일부 입력" autocomplete="off" />
+    <button id="searchBtn">검색</button>
+  </div>
+
+  <details class="advanced">
+    <summary>테스트 시각 지정 (선택)</summary>
+    <div class="row">
+      <input id="testTime" type="datetime-local" />
+      <button id="clearTestTime" type="button" style="background:#9ca3af;">지금 시각으로</button>
+    </div>
+  </details>
+
+  <div id="message"></div>
+  <div id="candidates" class="candList"></div>
+  <div id="result"></div>
+
+  <div class="footer" id="versionFooter"></div>
+</div>
+
+<script>
+  var qInput = document.getElementById('q');
+  var searchBtn = document.getElementById('searchBtn');
+  var testTimeInput = document.getElementById('testTime');
+  var messageEl = document.getElementById('message');
+  var candidatesEl = document.getElementById('candidates');
+  var resultEl = document.getElementById('result');
+
+  document.getElementById('clearTestTime').onclick = function () { testTimeInput.value = ''; };
+  searchBtn.onclick = doSearch;
+  qInput.addEventListener('keydown', function (e) { if (e.key === 'Enter') doSearch(); });
+
+  function getTestTime() {
+    var v = testTimeInput.value;
+    return v ? v : null;
+  }
+
+  function doSearch() {
+    var q = qInput.value.trim();
+    candidatesEl.innerHTML = '';
+    resultEl.innerHTML = '';
+    if (!q) { setMessage('학번 또는 이름을 입력하세요.'); return; }
+    setMessage('검색 중...');
+    google.script.run
+      .withSuccessHandler(onSearchResult)
+      .withFailureHandler(onFail)
+      .searchStudent(q, getTestTime());
+  }
+
+  function onSearchResult(res) {
+    if (res.status === 'none') { setMessage(res.message, true); return; }
+    if (res.status === 'error') { setMessage(res.message, true); return; }
+    if (res.status === 'one') { setMessage(''); renderDetail(res.detail); return; }
+    if (res.status === 'multiple') {
+      setMessage(res.candidates.length + '명이 검색되었습니다. 선택하세요.');
+      renderCandidates(res.candidates);
+    }
+  }
+
+  function renderCandidates(list) {
+    candidatesEl.innerHTML = '';
+    list.forEach(function (s) {
+      var div = document.createElement('div');
+      div.className = 'candItem';
+      div.innerHTML =
+        '<span class="name">' + escapeHtml(s.name) + '</span>' +
+        '<span class="meta">' + s.grade + '학년 ' + s.homeroom + '반 ' + s.no + '번 · ' + s.id + '</span>';
+      div.onclick = function () {
+        setMessage('불러오는 중...');
+        google.script.run
+          .withSuccessHandler(function (res) {
+            if (res.status === 'one') { setMessage(''); candidatesEl.innerHTML=''; renderDetail(res.detail); }
+            else setMessage(res.message, true);
+          })
+          .withFailureHandler(onFail)
+          .getStudentDetail(s.id, getTestTime());
+      };
+      candidatesEl.appendChild(div);
+    });
+  }
+
+  function renderDetail(d) {
+    var s = d.student;
+    var cur = d.current;
+    var dim = (cur.status === '주말' || cur.status === '등교 전' || cur.status === '방과 후' ||
+               cur.status === '쉬는 시간' || cur.status === '점심 시간' || cur.status === '하교');
+
+    var html = '';
+    html += '<div class="card">';
+    html += '  <div class="studentHead">';
+    html += '    <span class="name">' + escapeHtml(s.name) + '</span>';
+    html += '    <span class="meta">' + s.grade + '학년 ' + s.homeroom + '반 ' + s.no + '번 · ' + escapeHtml(String(s.id)) + '</span>';
+    html += '  </div>';
+
+    html += '  <div class="statusBox' + (dim ? ' dim' : '') + '">';
+    html += '    <div class="status">' + escapeHtml(cur.status) + (cur.periodLabel ? ' · ' + cur.periodLabel : '') + (cur.timeRange ? ' (' + cur.timeRange + ')' : '') + '</div>';
+    if (cur.location) html += '    <div class="loc">📍 ' + escapeHtml(cur.location) + '</div>';
+    if (cur.subject) html += '    <div class="sub">' + escapeHtml(cur.subject) + (cur.teacher ? ' · ' + escapeHtml(cur.teacher) + ' 선생님' : '') + '</div>';
+    if (cur.message) html += '    <div class="sub">' + escapeHtml(cur.message) + '</div>';
+    html += '  </div>';
+
+    if (d.todaySchedule && d.todaySchedule.length) {
+      html += '  <div class="sectionTitle">오늘(' + d.dayLabel + ') 시간표</div>';
+      html += '  <table><thead><tr><th>교시</th><th>시간</th><th>위치</th><th>과목</th><th>교사</th></tr></thead><tbody>';
+      d.todaySchedule.forEach(function (row) {
+        html += '<tr class="' + (row.isCurrent ? 'current' : '') + '">' +
+          '<td>' + row.period + '</td>' +
+          '<td>' + escapeHtml(row.timeRange) + '</td>' +
+          '<td>' + escapeHtml(row.location) + '</td>' +
+          '<td>' + escapeHtml(row.subject) + '</td>' +
+          '<td>' + escapeHtml(row.teacher) + '</td>' +
+          '</tr>';
+      });
+      html += '  </tbody></table>';
+    }
+
+    if (d.specialInfo && d.specialInfo.length) {
+      html += '  <div class="sectionTitle">고정 선택시간 참고정보</div>';
+      html += '  <ul class="specialList">';
+      d.specialInfo.forEach(function (sp) {
+        html += '<li><span class="lab">' + escapeHtml(sp.label) + '</span><span>' + escapeHtml(sp.subject) + ' · ' + escapeHtml(sp.location) + '</span></li>';
+      });
+      html += '  </ul>';
+    }
+
+    html += '  <div class="footer">생성 시각: ' + escapeHtml(d.generatedAt) + (d.usedTestTime ? ' (테스트 시각 기준)' : '') + '</div>';
+    html += '</div>';
+
+    resultEl.innerHTML = html;
+  }
+
+  function setMessage(msg, isError) {
+    messageEl.textContent = msg || '';
+    messageEl.className = isError ? 'error' : '';
+  }
+
+  function onFail(err) {
+    setMessage('오류가 발생했습니다: ' + (err && err.message ? err.message : err), true);
+  }
+
+  function escapeHtml(str) {
+    return String(str == null ? '' : str)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  google.script.run.withSuccessHandler(function (v) {
+    document.getElementById('versionFooter').textContent =
+      '이동수업 위치 확인 프로그램 v' + v.version + ' (' + v.date + ')';
+  }).getVersionInfo();
+</script>

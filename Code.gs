@@ -1,0 +1,586 @@
+/**
+ * ==========================================================================
+ *  2026 이동수업 위치 확인 프로그램 - Code.gs
+ * ==========================================================================
+ *  "2026 이동수업 위치 확인 프로그램.xlsx" 을 이 스크립트가 바인딩된
+ *  구글 시트로 변환/업로드한 뒤 사용합니다. (파일 > Google Sheets로 저장)
+ *
+ *  구조 요약
+ *   - "시간표" 시트   : 학년/반(=이동반 번호)별 요일·교시 칸에
+ *                       "A_과목명\n교사명" (이동수업, 앞의 대문자_ 는 슬롯문자)
+ *                       또는 "과목명\n교사명" / "자율" / "창체" / "하교" (원반 고정수업)
+ *   - "N-M" 시트들    : (예: 2-1, 3-12) 학년 N, 반 M 학생 명단.
+ *                       순번/신학번/이름 + (과목, 이동반) 쌍 컬럼들.
+ *                       2학년: 타임형A~E (5개)
+ *                       3학년: "공학/인공/일/중", "미감비/음감비" 고정 2개
+ *                              + 타임형A~F (6개)
+ *   - 신학번 5자리 = 학년(1) + 반(2, zero-pad) + 번호(2, zero-pad)
+ *
+ *  핵심 아이디어
+ *   1) "시간표" 시트에서 대문자 슬롯문자(A,B,C...)가 붙은 칸을 모두 훑어
+ *      학년별로 "이 문자는 어느 요일/교시들에 나타나는가"를 수집한다
+ *      (letterTimeSets). 같은 문자가 한 주에 여러 번(예: 주 3회) 나타날 수 있다.
+ *   2) 학생 명단 시트의 "타임형X" 헤더는 문자 X 가 이미 명시돼 있으므로
+ *      바로 매칭한다.
+ *   3) 3학년의 "공학/인공/일/중", "미감비/음감비" 처럼 문자가 헤더에 없는
+ *      컬럼은, letterTimeSets 에는 있지만 아직 학생 컬럼과 연결되지 않은
+ *      "남는 문자"(보통 G, H)를 헤더 텍스트를 '/' 로 쪼갠 키워드와
+ *      시간표 상의 실제 과목 텍스트를 대조해 자동으로 매칭한다.
+ *      => 과목/학기가 바뀌어도 헤더 표기 규칙만 유지되면 코드 수정 불필요.
+ *   4) 조회 시점(현재 시각 또는 테스트 시각)의 요일/교시를 구하고,
+ *      학생의 원 소속 반(homeroom) 행에서 그 요일/교시가 어떤 문자에
+ *      속하는지 확인 → 학생 자신의 해당 슬롯(과목, 이동반)을 찾아
+ *      "이동반 번호 = 실제 위치(교실)"로 표시한다. 문자가 없으면
+ *      원래 반 교실에서 시간표 칸 그대로의 수업(자율/창체/하교 등)을 한다.
+ *
+ *  한계 / 유의사항 (테스트 후 필요시 조정)
+ *   - "공학/인공/일/중", "미감비/음감비" 같은 고정군 매칭은 자동 추론이므로
+ *     학기 초 데이터로 반드시 실제와 대조 확인할 것.
+ *   - 이동반 값이 텍스트(예: "교과교실2(3층)")인 경우 해당 반의 시간표 행이
+ *     없으므로 담당교사 정보는 표시되지 않는다(위치명만 표시).
+ *   - 1학년은 이동수업 명단 시트가 없어 조회 대상에서 제외된다.
+ * ==========================================================================
+ */
+
+var CONFIG = {
+  TIMETABLE_SHEET: '시간표',
+  ROSTER_SHEET_PATTERN: /^(\d+)-(\d+)$/, // 예: "2-1", "3-12"
+  TIMEZONE: 'Asia/Seoul',
+  MAX_SEARCH_RESULTS: 30,
+  VERSION: '1.0.0',
+  VERSION_DATE: '2026-08-29',
+  CHANGELOG: [
+    { version: '1.0.0', date: '2026-08-29', note: '최초 작성: 학번/이름 일부 검색, 현재 위치 및 오늘 시간표 표시' }
+  ]
+};
+
+// ==========================================================================
+// 웹앱 진입점
+// ==========================================================================
+
+function doGet(e) {
+  return HtmlService.createHtmlOutputFromFile('Index')
+    .setTitle('이동수업 위치 확인')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+function getVersionInfo() {
+  return {
+    version: CONFIG.VERSION,
+    date: CONFIG.VERSION_DATE,
+    changelog: CONFIG.CHANGELOG
+  };
+}
+
+// ==========================================================================
+// 클라이언트에서 호출하는 API
+// ==========================================================================
+
+/**
+ * 학번(숫자) 또는 이름 일부로 학생을 검색한다.
+ * 결과가 1명이면 바로 상세 정보까지 포함해서 반환한다.
+ */
+function searchStudent(query, testTime) {
+  try {
+    var data = buildData_();
+    var matches = findStudents_(data, query);
+
+    if (matches.length === 0) {
+      var hint = '';
+      if (/^1\d{4}$/.test(String(query || '').trim())) {
+        hint = ' (1학년은 이동수업 대상이 아닙니다)';
+      }
+      return { status: 'none', message: '일치하는 학생을 찾을 수 없습니다.' + hint };
+    }
+    if (matches.length === 1) {
+      return { status: 'one', detail: buildStudentResult_(data, matches[0], testTime) };
+    }
+    return {
+      status: 'multiple',
+      candidates: matches.map(briefStudent_)
+    };
+  } catch (err) {
+    return { status: 'error', message: '오류: ' + (err && err.message ? err.message : err) };
+  }
+}
+
+/** 검색 결과가 여러 명일 때, 학번으로 상세 정보를 조회한다. */
+function getStudentDetail(id, testTime) {
+  try {
+    var data = buildData_();
+    var student = data.roster.byId[String(id)];
+    if (!student) return { status: 'none', message: '학번을 찾을 수 없습니다: ' + id };
+    return { status: 'one', detail: buildStudentResult_(data, student, testTime) };
+  } catch (err) {
+    return { status: 'error', message: '오류: ' + (err && err.message ? err.message : err) };
+  }
+}
+
+// ==========================================================================
+// 데이터 로드 (매 요청마다 새로 읽음 - 데이터가 자주 바뀌지 않는 규모라
+//  캐싱 없이도 충분히 빠름. 필요시 CacheService 청크 저장으로 확장 가능)
+// ==========================================================================
+
+function buildData_() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) throw new Error('이 스크립트가 스프레드시트에 연결되어 있지 않습니다.');
+  var timetable = parseTimetable_(ss);
+  var roster = parseRoster_(ss);
+  linkSpecialLetters_(timetable, roster);
+  return { timetable: timetable, roster: roster };
+}
+
+// ---------------------------- 시간표 파싱 --------------------------------
+
+function parseTimetable_(ss) {
+  var sheet = ss.getSheetByName(CONFIG.TIMETABLE_SHEET);
+  if (!sheet) throw new Error('"' + CONFIG.TIMETABLE_SHEET + '" 시트를 찾을 수 없습니다.');
+  var values = sheet.getDataRange().getValues();
+
+  // 헤더 행 찾기: '학년' 과 '반' 이 같은 행에 있는 행
+  var headerRowIdx = -1, gradeCol = -1, classCol = -1;
+  for (var r = 0; r < Math.min(values.length, 10); r++) {
+    var g = values[r].indexOf('학년');
+    var c = values[r].indexOf('반');
+    if (g !== -1 && c !== -1) { headerRowIdx = r; gradeCol = g; classCol = c; break; }
+  }
+  if (headerRowIdx === -1) throw new Error('"시간표" 시트에서 헤더(학년/반) 행을 찾지 못했습니다.');
+
+  var dayNameRow = values[headerRowIdx];
+  var timeRangeRow = values[headerRowIdx + 1] || [];
+  var periodNumRow = values[headerRowIdx + 2] || [];
+  var dataStartRow = headerRowIdx + 3;
+
+  // 요일/교시 -> 컬럼 매핑 (요일명은 병합셀이라 오른쪽으로 이어지며 빈칸)
+  var colMap = {}; // colIdx -> {day, period}
+  var lastCol = dayNameRow.length;
+  var curDay = null;
+  for (var col = classCol + 1; col < lastCol; col++) {
+    var dayVal = dayNameRow[col];
+    if (dayVal !== '' && dayVal !== null && dayVal !== undefined) curDay = String(dayVal).trim();
+    var pVal = periodNumRow[col];
+    var period = null;
+    if (typeof pVal === 'number') period = pVal;
+    else if (typeof pVal === 'string' && /^\d+$/.test(pVal.trim())) period = parseInt(pVal.trim(), 10);
+    if (curDay && period) colMap[col] = { day: curDay, period: period };
+  }
+
+  var dayOrder = ['월', '화', '수', '목', '금'];
+
+  // 교시별 시간 (처음 발견된 값 사용)
+  var periodTimes = {}; // period -> {startMin, endMin, label}
+  Object.keys(colMap).forEach(function (colStr) {
+    var col = Number(colStr);
+    var period = colMap[col].period;
+    if (periodTimes[period]) return;
+    var raw = timeRangeRow[col];
+    if (typeof raw === 'string' && raw.indexOf('~') !== -1) {
+      var parts = raw.split('~');
+      var s = toMinutes_(parts[0].trim());
+      var e = toMinutes_(parts[1].trim());
+      if (s !== null && e !== null) periodTimes[period] = { startMin: s, endMin: e, label: raw.trim() };
+    }
+  });
+
+  // 데이터 행 순회하며 grid, letterTimeSets 구성
+  var grid = {};          // grid[grade][classNum][day][period] = {subject, teacher, letter, raw}
+  var letterTimeSets = {}; // letterTimeSets[grade][letter] = ["day,period", ...]
+  var curGrade = null;
+
+  for (var row = dataStartRow; row < values.length; row++) {
+    var rowVals = values[row];
+    var gVal = rowVals[gradeCol];
+    if (gVal !== '' && gVal !== null && gVal !== undefined) curGrade = Number(gVal);
+    var cVal = rowVals[classCol];
+    if (cVal === '' || cVal === null || cVal === undefined) continue;
+    var classNum = extractLeadingNumber_(cVal);
+    if (classNum === null || curGrade === null) continue;
+
+    grid[curGrade] = grid[curGrade] || {};
+    grid[curGrade][classNum] = grid[curGrade][classNum] || {};
+    letterTimeSets[curGrade] = letterTimeSets[curGrade] || {};
+
+    Object.keys(colMap).forEach(function (colStr) {
+      var col = Number(colStr);
+      var cellRaw = rowVals[col];
+      if (cellRaw === '' || cellRaw === null || cellRaw === undefined) return;
+      var day = colMap[col].day, period = colMap[col].period;
+      var parsed = parseCellText_(String(cellRaw));
+
+      grid[curGrade][classNum][day] = grid[curGrade][classNum][day] || {};
+      grid[curGrade][classNum][day][period] = parsed;
+
+      if (parsed.letter) {
+        letterTimeSets[curGrade][parsed.letter] = letterTimeSets[curGrade][parsed.letter] || [];
+        var key = day + ',' + period;
+        if (letterTimeSets[curGrade][parsed.letter].indexOf(key) === -1) {
+          letterTimeSets[curGrade][parsed.letter].push(key);
+        }
+      }
+    });
+  }
+
+  return {
+    dayOrder: dayOrder,
+    periodTimes: periodTimes,
+    grid: grid,
+    letterTimeSets: letterTimeSets,
+    specialLetterMap: {} // linkSpecialLetters_ 에서 채움: {grade: {letter: label}}
+  };
+}
+
+function parseCellText_(raw) {
+  var lines = raw.split('\n').map(function (s) { return s.trim(); }).filter(function (s) { return s !== ''; });
+  var subjectLine = lines[0] || '';
+  var teacher = lines[1] || '';
+  var m = subjectLine.match(/^([A-Z])_(.+)$/);
+  if (m) {
+    return { subject: m[2].trim(), teacher: teacher, letter: m[1], raw: raw };
+  }
+  return { subject: subjectLine, teacher: teacher, letter: null, raw: raw };
+}
+
+function toMinutes_(hhmm) {
+  var m = hhmm.match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return null;
+  return parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
+}
+
+function extractLeadingNumber_(val) {
+  if (typeof val === 'number') return val;
+  var m = String(val).trim().match(/^(\d+)/);
+  return m ? parseInt(m[1], 10) : null;
+}
+
+// ---------------------------- 명단 파싱 -----------------------------------
+
+function parseRoster_(ss) {
+  var allStudents = [];
+  var byId = {};
+  var gradeColumns = {}; // grade -> [{type:'letter',letter}|{type:'special',label,keywords}]
+
+  ss.getSheets().forEach(function (sheet) {
+    var m = sheet.getName().match(CONFIG.ROSTER_SHEET_PATTERN);
+    if (!m) return;
+    var grade = parseInt(m[1], 10);
+    var homeroom = parseInt(m[2], 10);
+
+    var values = sheet.getDataRange().getValues();
+    var headerRowIdx = -1, idCol = -1, nameCol = -1, noCol = -1;
+    for (var r = 0; r < Math.min(values.length, 8); r++) {
+      var row = values[r].map(function (v) { return String(v || '').trim(); });
+      var ic = row.indexOf('신학번');
+      if (ic !== -1) {
+        headerRowIdx = r; idCol = ic;
+        noCol = row.indexOf('순번');
+        nameCol = row.indexOf('이름');
+        break;
+      }
+    }
+    if (headerRowIdx === -1) return; // 형식이 다른 시트는 건너뜀
+
+    var header = values[headerRowIdx];
+    // (과목컬럼, 이동반컬럼) 쌍 찾기: nameCol 다음부터 순회
+    var slotDefs = []; // {col, moveCol, type:'letter'|'special', letter?, label?}
+    for (var c = nameCol + 1; c < header.length; c++) {
+      var h = normalizeHeader_(header[c]);
+      if (!h || h === '이동반') continue;
+      var lm = h.match(/^타임형([A-Z])$/);
+      var moveCol = c + 1;
+      if (String(normalizeHeader_(header[moveCol])) !== '이동반') continue; // 짝이 안 맞으면 스킵
+      if (lm) {
+        slotDefs.push({ col: c, moveCol: moveCol, type: 'letter', letter: lm[1] });
+      } else {
+        slotDefs.push({ col: c, moveCol: moveCol, type: 'special', label: h });
+      }
+    }
+
+    if (!gradeColumns[grade]) gradeColumns[grade] = slotDefs;
+
+    for (var rr = headerRowIdx + 1; rr < values.length; rr++) {
+      var dr = values[rr];
+      var idVal = dr[idCol];
+      if (idVal === '' || idVal === null || idVal === undefined) continue; // 명단 끝
+      var student = {
+        id: String(idVal).trim(),
+        no: dr[noCol],
+        name: String(dr[nameCol] || '').trim(),
+        grade: grade,
+        homeroom: homeroom,
+        sheet: sheet.getName(),
+        slots: []
+      };
+      slotDefs.forEach(function (def) {
+        var subjectRaw = dr[def.col];
+        var moveRaw = dr[def.moveCol];
+        if (subjectRaw === '' || subjectRaw === null || subjectRaw === undefined) return;
+        var moveClass = moveRaw;
+        if (typeof moveClass === 'number' && !Number.isInteger(moveClass)) moveClass = Math.round(moveClass);
+        var slot = {
+          type: def.type,
+          subject: String(subjectRaw).trim(),
+          moveClass: (typeof moveClass === 'string') ? moveClass.trim() : moveClass
+        };
+        if (def.type === 'letter') slot.letter = def.letter;
+        else slot.label = def.label;
+        student.slots.push(slot);
+      });
+
+      allStudents.push(student);
+      byId[student.id] = student;
+    }
+  });
+
+  return { allStudents: allStudents, byId: byId, gradeColumns: gradeColumns };
+}
+
+function normalizeHeader_(h) {
+  return String(h || '').replace(/\s+/g, '');
+}
+
+/**
+ * "시간표" 상에서 발견됐지만(letterTimeSets) 아직 학생 명단의 '타임형X' 로
+ * 연결되지 않은 문자(주로 3학년의 G,H)를, 해당 문자가 붙은 과목 텍스트와
+ * 학생 명단의 '특수 컬럼' 헤더(예: "공학/인공/일/중")를 '/' 로 쪼갠
+ * 키워드로 대조하여 자동 매칭한다.
+ */
+function linkSpecialLetters_(timetable, roster) {
+  Object.keys(timetable.letterTimeSets).forEach(function (gradeStr) {
+    var grade = Number(gradeStr);
+    var claimedLetters = {};
+    var specialHeaders = []; // {label, keywords}
+    (roster.gradeColumns[grade] || []).forEach(function (def) {
+      if (def.type === 'letter') claimedLetters[def.letter] = true;
+      else if (def.type === 'special' && !specialHeaders.some(function (s) { return s.label === def.label; })) {
+        var keywords = def.label.split('/').map(function (s) { return s.replace(/\s+/g, ''); }).filter(Boolean);
+        specialHeaders.push({ label: def.label, keywords: keywords });
+      }
+    });
+
+    var map = {};
+    Object.keys(timetable.letterTimeSets[grade]).forEach(function (letter) {
+      if (claimedLetters[letter]) return; // 이미 타임형X 로 알려진 문자
+
+      // 이 문자가 붙은 과목 텍스트 샘플 수집
+      var samples = {};
+      var gridForGrade = timetable.grid[grade] || {};
+      Object.keys(gridForGrade).forEach(function (classNum) {
+        var byDay = gridForGrade[classNum];
+        Object.keys(byDay).forEach(function (day) {
+          Object.keys(byDay[day]).forEach(function (period) {
+            var cell = byDay[day][period];
+            if (cell.letter === letter) samples[cell.subject] = true;
+          });
+        });
+      });
+      var sampleTexts = Object.keys(samples);
+
+      var matched = specialHeaders.find(function (sh) {
+        return sampleTexts.some(function (txt) {
+          return sh.keywords.some(function (kw) { return kw && txt.indexOf(kw) === 0; });
+        });
+      });
+      if (matched) map[letter] = matched.label;
+    });
+
+    timetable.specialLetterMap[grade] = map;
+  });
+}
+
+// ==========================================================================
+// 검색 / 조회 로직
+// ==========================================================================
+
+function findStudents_(data, query) {
+  var q = String(query || '').trim();
+  if (!q) return [];
+  var list = data.roster.allStudents;
+
+  if (/^\d+$/.test(q)) {
+    if (data.roster.byId[q]) return [data.roster.byId[q]];
+    return list.filter(function (s) { return s.id.indexOf(q) !== -1; }).slice(0, CONFIG.MAX_SEARCH_RESULTS);
+  }
+  return list.filter(function (s) { return s.name.indexOf(q) !== -1; }).slice(0, CONFIG.MAX_SEARCH_RESULTS);
+}
+
+function briefStudent_(s) {
+  return { id: s.id, name: s.name, grade: s.grade, homeroom: s.homeroom, no: s.no };
+}
+
+function buildStudentResult_(data, student, testTime) {
+  var now = testTime ? new Date(testTime) : new Date();
+  var tz = CONFIG.TIMEZONE;
+  var dowIso = Number(Utilities.formatDate(now, tz, 'u')); // 1=월 ... 7=일
+  var hh = Number(Utilities.formatDate(now, tz, 'HH'));
+  var mm = Number(Utilities.formatDate(now, tz, 'mm'));
+  var minutes = hh * 60 + mm;
+  var dayNames = { 1: '월', 2: '화', 3: '수', 4: '목', 5: '금', 6: '토', 7: '일' };
+  var dayLabel = dayNames[dowIso];
+  var dayOrder = data.timetable.dayOrder; // ['월','화','수','목','금']
+  var todayIsWeekday = dowIso >= 1 && dowIso <= 5;
+  var today = todayIsWeekday ? dayOrder[dowIso - 1] : null;
+
+  var result = {
+    student: briefStudent_(student),
+    generatedAt: Utilities.formatDate(now, tz, 'yyyy-MM-dd HH:mm:ss'),
+    usedTestTime: !!testTime,
+    dayLabel: dayLabel,
+    current: null,
+    todaySchedule: [],
+    specialInfo: [],
+    version: CONFIG.VERSION
+  };
+
+  // 고정군(공학/인공/일/중, 미감비/음감비 등) 참고 정보 - 항상 표시
+  student.slots.filter(function (s) { return s.type === 'special'; }).forEach(function (s) {
+    result.specialInfo.push({
+      label: s.label,
+      subject: s.subject,
+      location: formatLocation_(student.grade, s.moveClass)
+    });
+  });
+
+  if (!todayIsWeekday) {
+    result.current = { status: '주말', message: '오늘은 ' + dayLabel + '요일입니다. 수업이 없습니다.' };
+    return result;
+  }
+
+  var periodState = findPeriodState_(data.timetable.periodTimes, minutes);
+
+  if (periodState.state === 'in') {
+    result.current = resolvePeriod_(data, student, today, periodState.period);
+    result.current.periodLabel = periodState.period + '교시';
+    result.current.timeRange = data.timetable.periodTimes[periodState.period].label;
+  } else if (periodState.state === 'before') {
+    result.current = { status: '등교 전', message: '아직 등교 전 시간입니다.' };
+  } else if (periodState.state === 'after') {
+    result.current = { status: '방과 후', message: '오늘 수업이 모두 끝났습니다.' };
+  } else { // break
+    result.current = {
+      status: periodState.isLunch ? '점심 시간' : '쉬는 시간',
+      message: (periodState.isLunch ? '점심 시간입니다.' : '쉬는 시간입니다.') +
+        (periodState.nextPeriod ? ' (다음 ' + periodState.nextPeriod + '교시 대기 중)' : '')
+    };
+  }
+
+  // 오늘 전체 시간표
+  var periods = Object.keys(data.timetable.periodTimes).map(Number).sort(function (a, b) { return a - b; });
+  periods.forEach(function (p) {
+    var info = resolvePeriod_(data, student, today, p);
+    result.todaySchedule.push({
+      period: p,
+      timeRange: data.timetable.periodTimes[p].label,
+      status: info.status,
+      subject: info.subject || '',
+      teacher: info.teacher || '',
+      location: info.location || '',
+      isCurrent: periodState.state === 'in' && periodState.period === p
+    });
+  });
+
+  return result;
+}
+
+function findPeriodState_(periodTimes, minutes) {
+  var periods = Object.keys(periodTimes).map(Number).sort(function (a, b) { return a - b; });
+  if (periods.length === 0) return { state: 'after' };
+
+  if (minutes < periodTimes[periods[0]].startMin) return { state: 'before' };
+  var last = periods[periods.length - 1];
+  if (minutes > periodTimes[last].endMin) return { state: 'after' };
+
+  for (var i = 0; i < periods.length; i++) {
+    var p = periods[i];
+    var t = periodTimes[p];
+    if (minutes >= t.startMin && minutes <= t.endMin) return { state: 'in', period: p };
+  }
+  // 교시 사이 쉬는 시간/점심 시간
+  for (var j = 0; j < periods.length - 1; j++) {
+    var cur = periodTimes[periods[j]], next = periodTimes[periods[j + 1]];
+    if (minutes > cur.endMin && minutes < next.startMin) {
+      var gap = next.startMin - cur.endMin;
+      return { state: 'break', isLunch: gap >= 45, nextPeriod: periods[j + 1] };
+    }
+  }
+  return { state: 'after' };
+}
+
+/** 특정 요일/교시에 학생이 어디서 무엇을 하는지 계산한다. */
+function resolvePeriod_(data, student, day, period) {
+  var grid = data.timetable.grid;
+  var grade = student.grade;
+  var ownCell = grid[grade] && grid[grade][student.homeroom] &&
+    grid[grade][student.homeroom][day] && grid[grade][student.homeroom][day][period];
+
+  // 이 요일/교시가 어떤 슬롯 문자에 해당하는지 확인 (grade 전체에서 그 문자가
+  // 쓰인 요일/교시 집합에 현재가 포함되는지로 판단 - 원반 칸에 문자가 없어도
+  // (예: G/H 처럼 소수 교실만 호스트) 학년 전체 기준으로 판단 가능)
+  var activeLetter = null;
+  var sets = data.timetable.letterTimeSets[grade] || {};
+  var key = day + ',' + period;
+  Object.keys(sets).forEach(function (letter) {
+    if (sets[letter].indexOf(key) !== -1) activeLetter = letter;
+  });
+
+  if (activeLetter) {
+    // 1) 학생의 '타임형X' 슬롯에서 직접 매칭
+    var slot = student.slots.filter(function (s) { return s.type === 'letter' && s.letter === activeLetter; })[0];
+    // 2) 없으면 특수군(G/H 등)으로 연결된 라벨을 통해 매칭
+    if (!slot) {
+      var label = (data.timetable.specialLetterMap[grade] || {})[activeLetter];
+      if (label) slot = student.slots.filter(function (s) { return s.type === 'special' && s.label === label; })[0];
+    }
+    if (slot) {
+      var subjectDisplay = slot.subject.replace(new RegExp('-' + activeLetter + '$'), '');
+      var teacher = '';
+      if (typeof slot.moveClass === 'number') {
+        var destCell = grid[grade] && grid[grade][slot.moveClass] &&
+          grid[grade][slot.moveClass][day] && grid[grade][slot.moveClass][day][period];
+        if (destCell) teacher = destCell.teacher;
+      }
+      return {
+        status: '이동수업',
+        subject: subjectDisplay,
+        teacher: teacher,
+        location: formatLocation_(grade, slot.moveClass)
+      };
+    }
+    // 학생 데이터에서 이 문자를 찾지 못한 경우 - 원반 칸 내용을 그대로 참고 정보로 표시
+    if (ownCell) {
+      return {
+        status: '이동수업(추정)',
+        subject: ownCell.subject,
+        teacher: ownCell.teacher,
+        location: '확인 필요 (원본 시간표: ' + formatLocation_(grade, student.homeroom) + ')'
+      };
+    }
+  }
+
+  // 슬롯 문자가 없는 일반(원반) 시간
+  if (!ownCell) {
+    return { status: '정보 없음', subject: '', teacher: '', location: '' };
+  }
+  if (ownCell.subject === '하교') {
+    return { status: '하교', subject: '하교', teacher: '', location: '' };
+  }
+  if (ownCell.subject === '창체') {
+    return { status: '창의적 체험활동', subject: '창체', teacher: ownCell.teacher, location: formatLocation_(grade, student.homeroom) };
+  }
+  if (ownCell.subject === '자율') {
+    return { status: '자율학습', subject: '자율', teacher: ownCell.teacher, location: formatLocation_(grade, student.homeroom) };
+  }
+  return {
+    status: '수업 중(원반)',
+    subject: ownCell.subject,
+    teacher: ownCell.teacher,
+    location: formatLocation_(grade, student.homeroom)
+  };
+}
+
+function formatLocation_(grade, classNumOrText) {
+  if (typeof classNumOrText === 'number') {
+    return grade + '학년 ' + classNumOrText + '반 교실 (이동반 ' + classNumOrText + ')';
+  }
+  return String(classNumOrText || '').trim();
+}
