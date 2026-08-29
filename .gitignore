@@ -1,0 +1,8 @@
+# 실명(학생/교사 개인정보)이 담긴 원본 데이터는 절대 커밋하지 않는다.
+# GitHub에는 개인정보를 제거한 template.xlsx만 올린다.
+2026 이동수업 위치 확인 프로그램.xlsx
+~$*.xlsx
+*.xlsx
+!template.xlsx
+
+.DS_Store
