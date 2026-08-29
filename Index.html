@@ -84,6 +84,22 @@
   tr.current td { background: var(--ok-bg); font-weight: 600; }
   tr.current td:first-child { border-left: 3px solid var(--ok); }
 
+  .noteBox {
+    margin-top: 12px; padding: 10px 12px; background: var(--warn-bg); color: var(--warn);
+    border-radius: 10px; font-size: 13px;
+  }
+
+  .weekWrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  table.week { min-width: 560px; font-size: 12px; }
+  table.week th, table.week td { text-align: center; padding: 6px 4px; vertical-align: top; }
+  table.week th.periodCol, table.week td.periodCol { text-align: left; white-space: nowrap; color: var(--sub); }
+  table.week th.todayCol { color: var(--accent); }
+  table.week td.todayCol { background: #fafbff; }
+  table.week td.curCell { background: var(--ok-bg); border-radius: 8px; box-shadow: inset 0 0 0 2px var(--ok); }
+  .cellLoc { font-weight: 600; }
+  .cellSub { color: var(--sub); font-size: 11px; margin-top: 2px; }
+  .cellEmpty { color: #d1d5db; }
+
   .sectionTitle { margin: 20px 0 4px; font-size: 14px; font-weight: 700; color: var(--sub); }
   .specialList { list-style: none; padding: 0; margin: 6px 0 0; }
   .specialList li {
@@ -199,19 +215,33 @@
     if (cur.message) html += '    <div class="sub">' + escapeHtml(cur.message) + '</div>';
     html += '  </div>';
 
-    if (d.todaySchedule && d.todaySchedule.length) {
-      html += '  <div class="sectionTitle">오늘(' + d.dayLabel + ') 시간표</div>';
-      html += '  <table><thead><tr><th>교시</th><th>시간</th><th>위치</th><th>과목</th><th>교사</th></tr></thead><tbody>';
-      d.todaySchedule.forEach(function (row) {
-        html += '<tr class="' + (row.isCurrent ? 'current' : '') + '">' +
-          '<td>' + row.period + '</td>' +
-          '<td>' + escapeHtml(row.timeRange) + '</td>' +
-          '<td>' + escapeHtml(row.location) + '</td>' +
-          '<td>' + escapeHtml(row.subject) + '</td>' +
-          '<td>' + escapeHtml(row.teacher) + '</td>' +
-          '</tr>';
+    if (d.note) html += '  <div class="noteBox">ℹ️ ' + escapeHtml(d.note) + '</div>';
+
+    if (d.weekSchedule && d.weekSchedule.length) {
+      html += '  <div class="sectionTitle">일주일 이동시간표</div>';
+      html += '  <div class="weekWrap"><table class="week"><thead><tr><th class="periodCol">교시</th>';
+      d.dayOrder.forEach(function (day) {
+        var isToday = day === d.today;
+        html += '<th class="' + (isToday ? 'todayCol' : '') + '">' + day + (isToday ? '<br><span style="font-size:10px;">(오늘)</span>' : '') + '</th>';
       });
-      html += '  </tbody></table>';
+      html += '</tr></thead><tbody>';
+      d.weekSchedule.forEach(function (row) {
+        html += '<tr><td class="periodCol">' + row.period + '교시<br><span class="cellSub">' + escapeHtml(row.timeRange) + '</span></td>';
+        d.dayOrder.forEach(function (day) {
+          var c = row.days[day];
+          var isToday = day === d.today;
+          var cls = (c.isCurrent ? 'curCell' : '') + (isToday && !c.isCurrent ? ' todayCol' : '');
+          if (!c.location && !c.subject) {
+            html += '<td class="' + cls + '"><span class="cellEmpty">' + escapeHtml(c.status || '-') + '</span></td>';
+          } else {
+            html += '<td class="' + cls + '"><div class="cellLoc">' + escapeHtml(c.location || c.status) + '</div>' +
+              (c.subject ? '<div class="cellSub">' + escapeHtml(c.subject) + (c.teacher ? ' · ' + escapeHtml(c.teacher) : '') + '</div>' : '') +
+              '</td>';
+          }
+        });
+        html += '</tr>';
+      });
+      html += '  </tbody></table></div>';
     }
 
     if (d.specialInfo && d.specialInfo.length) {

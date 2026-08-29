@@ -38,7 +38,11 @@
  *     학기 초 데이터로 반드시 실제와 대조 확인할 것.
  *   - 이동반 값이 텍스트(예: "교과교실2(3층)")인 경우 해당 반의 시간표 행이
  *     없으므로 담당교사 정보는 표시되지 않는다(위치명만 표시).
- *   - 1학년은 이동수업 명단 시트가 없어 조회 대상에서 제외된다.
+ *   - 1학년은 개인별 명단 시트가 없다. 학번이 "1+반(2)+번호(2)" 패턴이면
+ *     "시간표" 시트의 해당 학년/반 행만으로 "가상 학생"을 만들어 안내한다
+ *     (findGrade1Virtual_). 개인 선택과목이 없으므로 매 시간 원반 교실로 안내됨.
+ *   - 조회 결과는 "지금 이 순간의 위치" + "이 학생의 일주일 전체 이동시간표"
+ *     (교시 x 요일 그리드, 오늘/현재 교시 강조)를 함께 보여준다.
  * ==========================================================================
  */
 
@@ -47,10 +51,11 @@ var CONFIG = {
   ROSTER_SHEET_PATTERN: /^(\d+)-(\d+)$/, // 예: "2-1", "3-12"
   TIMEZONE: 'Asia/Seoul',
   MAX_SEARCH_RESULTS: 30,
-  VERSION: '1.0.0',
+  VERSION: '1.1.0',
   VERSION_DATE: '2026-08-29',
   CHANGELOG: [
-    { version: '1.0.0', date: '2026-08-29', note: '최초 작성: 학번/이름 일부 검색, 현재 위치 및 오늘 시간표 표시' }
+    { version: '1.0.0', date: '2026-08-29', note: '최초 작성: 학번/이름 일부 검색, 현재 위치 및 오늘 시간표 표시' },
+    { version: '1.1.0', date: '2026-08-29', note: '1학년(개인 명단 없음) 학급 시간표 기반 안내 추가, "오늘 시간표"를 "현재 위치 + 일주일 전체 이동시간표(교시x요일 그리드)"로 변경' }
   ]
 };
 
@@ -87,11 +92,9 @@ function searchStudent(query, testTime) {
     var matches = findStudents_(data, query);
 
     if (matches.length === 0) {
-      var hint = '';
-      if (/^1\d{4}$/.test(String(query || '').trim())) {
-        hint = ' (1학년은 이동수업 대상이 아닙니다)';
-      }
-      return { status: 'none', message: '일치하는 학생을 찾을 수 없습니다.' + hint };
+      var virtual = findGrade1Virtual_(data, query);
+      if (virtual) return { status: 'one', detail: buildStudentResult_(data, virtual, testTime) };
+      return { status: 'none', message: '일치하는 학생을 찾을 수 없습니다.' };
     }
     if (matches.length === 1) {
       return { status: 'one', detail: buildStudentResult_(data, matches[0], testTime) };
@@ -110,11 +113,37 @@ function getStudentDetail(id, testTime) {
   try {
     var data = buildData_();
     var student = data.roster.byId[String(id)];
+    if (!student) student = findGrade1Virtual_(data, id);
     if (!student) return { status: 'none', message: '학번을 찾을 수 없습니다: ' + id };
     return { status: 'one', detail: buildStudentResult_(data, student, testTime) };
   } catch (err) {
     return { status: 'error', message: '오류: ' + (err && err.message ? err.message : err) };
   }
+}
+
+/**
+ * 1학년은 개인별 이동수업 명단 시트가 없다(이동수업 대상이 아니므로).
+ * 학번이 "1+ 반(2자리) + 번호(2자리)" 패턴이면, 학급 전체 시간표("시간표" 시트의
+ * 해당 학년/반 행)만으로 안내 가능한 "가상 학생" 객체를 만들어준다.
+ * (개인 선택과목 슬롯이 없으므로 student.slots는 항상 빈 배열)
+ */
+function findGrade1Virtual_(data, query) {
+  var q = String(query || '').trim();
+  var m = q.match(/^1(\d{2})(\d{2})$/);
+  if (!m) return null;
+  var homeroom = parseInt(m[1], 10);
+  var no = parseInt(m[2], 10);
+  if (!data.timetable.grid[1] || !data.timetable.grid[1][homeroom]) return null; // 존재하지 않는 반
+  return {
+    id: q,
+    no: no,
+    name: '1학년 ' + homeroom + '반 ' + no + '번',
+    grade: 1,
+    homeroom: homeroom,
+    sheet: null,
+    slots: [],
+    isVirtual: true
+  };
 }
 
 // ==========================================================================
@@ -426,13 +455,16 @@ function buildStudentResult_(data, student, testTime) {
     generatedAt: Utilities.formatDate(now, tz, 'yyyy-MM-dd HH:mm:ss'),
     usedTestTime: !!testTime,
     dayLabel: dayLabel,
+    dayOrder: dayOrder,
+    today: today,
     current: null,
-    todaySchedule: [],
+    weekSchedule: [],
     specialInfo: [],
+    note: student.isVirtual ? '1학년은 개인별 이동수업 명단이 없어, 학급(반) 시간표를 기준으로 안내합니다.' : '',
     version: CONFIG.VERSION
   };
 
-  // 고정군(공학/인공/일/중, 미감비/음감비 등) 참고 정보 - 항상 표시
+  // 고정군(공학/인공/일/중, 미감비/음감비 등) 참고 정보 - 항상 표시 (해당 학년만)
   student.slots.filter(function (s) { return s.type === 'special'; }).forEach(function (s) {
     result.specialInfo.push({
       label: s.label,
@@ -441,14 +473,12 @@ function buildStudentResult_(data, student, testTime) {
     });
   });
 
+  // ---- 현재 상태 ----
+  var periodState = todayIsWeekday ? findPeriodState_(data.timetable.periodTimes, minutes) : { state: 'weekend' };
+
   if (!todayIsWeekday) {
     result.current = { status: '주말', message: '오늘은 ' + dayLabel + '요일입니다. 수업이 없습니다.' };
-    return result;
-  }
-
-  var periodState = findPeriodState_(data.timetable.periodTimes, minutes);
-
-  if (periodState.state === 'in') {
+  } else if (periodState.state === 'in') {
     result.current = resolvePeriod_(data, student, today, periodState.period);
     result.current.periodLabel = periodState.period + '교시';
     result.current.timeRange = data.timetable.periodTimes[periodState.period].label;
@@ -464,19 +494,21 @@ function buildStudentResult_(data, student, testTime) {
     };
   }
 
-  // 오늘 전체 시간표
+  // ---- 일주일 전체 이동시간표 (교시 x 요일) ----
   var periods = Object.keys(data.timetable.periodTimes).map(Number).sort(function (a, b) { return a - b; });
   periods.forEach(function (p) {
-    var info = resolvePeriod_(data, student, today, p);
-    result.todaySchedule.push({
-      period: p,
-      timeRange: data.timetable.periodTimes[p].label,
-      status: info.status,
-      subject: info.subject || '',
-      teacher: info.teacher || '',
-      location: info.location || '',
-      isCurrent: periodState.state === 'in' && periodState.period === p
+    var row = { period: p, timeRange: data.timetable.periodTimes[p].label, days: {} };
+    dayOrder.forEach(function (day) {
+      var info = resolvePeriod_(data, student, day, p);
+      row.days[day] = {
+        status: info.status,
+        subject: info.subject || '',
+        teacher: info.teacher || '',
+        location: info.location || '',
+        isCurrent: todayIsWeekday && periodState.state === 'in' && today === day && periodState.period === p
+      };
     });
+    result.weekSchedule.push(row);
   });
 
   return result;
@@ -552,7 +584,7 @@ function resolvePeriod_(data, student, day, period) {
         status: '이동수업(추정)',
         subject: ownCell.subject,
         teacher: ownCell.teacher,
-        location: '확인 필요 (원본 시간표: ' + formatLocation_(grade, student.homeroom) + ')'
+        location: '확인 필요 (원본 시간표: ' + formatOwnLocation_(grade, student.homeroom) + ')'
       };
     }
   }
@@ -565,22 +597,28 @@ function resolvePeriod_(data, student, day, period) {
     return { status: '하교', subject: '하교', teacher: '', location: '' };
   }
   if (ownCell.subject === '창체') {
-    return { status: '창의적 체험활동', subject: '창체', teacher: ownCell.teacher, location: formatLocation_(grade, student.homeroom) };
+    return { status: '창의적 체험활동', subject: '창체', teacher: ownCell.teacher, location: formatOwnLocation_(grade, student.homeroom) };
   }
   if (ownCell.subject === '자율') {
-    return { status: '자율학습', subject: '자율', teacher: ownCell.teacher, location: formatLocation_(grade, student.homeroom) };
+    return { status: '자율학습', subject: '자율', teacher: ownCell.teacher, location: formatOwnLocation_(grade, student.homeroom) };
   }
   return {
     status: '수업 중(원반)',
     subject: ownCell.subject,
     teacher: ownCell.teacher,
-    location: formatLocation_(grade, student.homeroom)
+    location: formatOwnLocation_(grade, student.homeroom)
   };
 }
 
+/** 이동수업 목적지(이동반 번호 또는 특별실 이름) 표시용 */
 function formatLocation_(grade, classNumOrText) {
   if (typeof classNumOrText === 'number') {
     return grade + '학년 ' + classNumOrText + '반 교실 (이동반 ' + classNumOrText + ')';
   }
   return String(classNumOrText || '').trim();
+}
+
+/** 학생 자신의 원래 반 교실 표시용 (이동반 문구 없이) */
+function formatOwnLocation_(grade, homeroom) {
+  return grade + '학년 ' + homeroom + '반 교실';
 }
